@@ -1,16 +1,11 @@
 """
 微信 iLink Bot 插件 - 主入口
-
-v1.3.0 关键改动：
-  · 插件独立线程 + 独立 asyncio 事件循环，与框架解耦
-  · 插件线程全局唯一（threading.Lock 保证）
-  · 所有业务逻辑提交到插件线程执行，框架线程只转发
-  · 统一登录状态机（QQ / Web 共享同一次登录）
 """
 
 import asyncio
 import base64
 import concurrent.futures
+import importlib
 import json
 import os
 import subprocess
@@ -36,8 +31,8 @@ __plugin_meta__ = {
     'name': 'wechat-bot',
     'author': '乄杺',
     'description': '利用微信ClawBot实现管理框架机器人、查看机器人DAU数据、查看系统状态',
-    'version': '1.0.3',
-    'github': 'https://github.com/linxi-root/wechat-bot',
+    'version': '1.0.4',
+    'github': 'https://github.com/linxi-root/elainabot-wechat-bot',
 }
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -48,7 +43,32 @@ PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
 if PLUGIN_DIR not in sys.path:
     sys.path.insert(0, PLUGIN_DIR)
 
-import ip_fallback  # noqa: E402
+
+def _reload_ip_fallback():
+    try:
+        if 'ip_fallback' in sys.modules:
+            mod = importlib.reload(sys.modules['ip_fallback'])
+        else:
+            mod = importlib.import_module('ip_fallback')
+    except Exception as e:
+        log.error(f"[微信Bot] 加载 ip_fallback 失败: {e}")
+        raise
+
+    if not hasattr(mod, 'set_use_fallback'):
+        log.warning("[微信Bot] ip_fallback 缺少 set_use_fallback，"
+                    "请确认 ip_fallback.py 已更新到最新版；本次使用兼容实现")
+
+        def _compat_set_use_fallback(v): pass
+        def _compat_get_use_fallback(): return False
+        def _compat_build_candidates(host, fallback_ips): return [None]
+
+        mod.set_use_fallback = _compat_set_use_fallback
+        mod.get_use_fallback = _compat_get_use_fallback
+        mod.build_candidates = _compat_build_candidates
+    return mod
+
+
+ip_fallback = _reload_ip_fallback()
 
 DATA_DIR = os.path.join(PLUGIN_DIR, 'data')
 CONFIG_PATH = os.path.join(DATA_DIR, 'config.yaml')
@@ -59,10 +79,10 @@ DEFAULT_CONFIG = {
     'use_image': True,
     'use_background': False,
     'auto_login': False,
+    'use_ip_fallback': False,
 }
 TOKEN_EXPIRE_DAYS = 7
 
-# 延迟导入子模块
 WeixinApiClient = None
 WeixinMessageSender = None
 WechatCommand = None
@@ -71,9 +91,21 @@ _SUBMODULES_OK = False
 _SUBMODULE_ERR = ""
 
 
+def _purge_plugin_submodules():
+    prefixes = ('app.weixin_api', 'app.commands', 'app.system_status')
+    for name in list(sys.modules.keys()):
+        if name in prefixes or any(name.endswith('.' + p) for p in prefixes):
+            try:
+                del sys.modules[name]
+            except Exception:
+                pass
+
+
 def _load_submodules() -> bool:
     global WeixinApiClient, WeixinMessageSender, WechatCommand
     global SessionExpiredError, _SUBMODULES_OK, _SUBMODULE_ERR
+
+    _purge_plugin_submodules()
     errors = []
     try:
         from .app.weixin_api import (
@@ -83,12 +115,10 @@ def _load_submodules() -> bool:
         WeixinApiClient, WeixinMessageSender = _C, _S
         SessionExpiredError, WechatCommand = _E, _Cmd
         _SUBMODULES_OK = True
-        log.info("[微信Bot] 子模块加载成功（相对导入）")
         return True
     except Exception as e:
         errors.append(f"相对: {e}")
     try:
-        import importlib
         for name, mod in list(sys.modules.items()):
             if getattr(mod, '__file__', None) == __file__ and '.' in name:
                 pkg = name.rsplit('.', 1)[0]
@@ -99,7 +129,6 @@ def _load_submodules() -> bool:
                 SessionExpiredError = getattr(m_api, 'SessionExpiredError', RuntimeError)
                 WechatCommand = m_cmd.WechatCommand
                 _SUBMODULES_OK = True
-                log.info(f"[微信Bot] 子模块加载成功（包名 {pkg}）")
                 return True
     except Exception as e:
         errors.append(f"包名: {e}")
@@ -111,7 +140,6 @@ def _load_submodules() -> bool:
         WeixinApiClient, WeixinMessageSender = _C, _S
         SessionExpiredError, WechatCommand = _E, _Cmd
         _SUBMODULES_OK = True
-        log.info("[微信Bot] 子模块加载成功（sys.path）")
         return True
     except Exception as e:
         errors.append(f"sys.path: {e}")
@@ -131,13 +159,11 @@ _plugin_loop_ready = threading.Event()
 
 
 def _plugin_thread_runner():
-    """插件线程主函数：创建独立 event loop 并 run_forever"""
     global _plugin_loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     _plugin_loop = loop
     _plugin_loop_ready.set()
-    log.info("[微信Bot] 插件线程已启动，独立 event loop 运行中")
     try:
         loop.run_forever()
     except Exception as e:
@@ -160,7 +186,6 @@ def _plugin_thread_runner():
 
 
 def _ensure_plugin_thread() -> bool:
-    """★ 确保插件线程唯一存在，返回是否就绪"""
     global _plugin_thread
     with _plugin_thread_lock:
         if _plugin_thread is not None and _plugin_thread.is_alive():
@@ -179,14 +204,12 @@ def _ensure_plugin_thread() -> bool:
 
 
 def _submit(coro) -> concurrent.futures.Future:
-    """从框架线程提交协程到插件线程执行"""
     if _plugin_loop is None:
         raise RuntimeError("插件线程未启动")
     return asyncio.run_coroutine_threadsafe(coro, _plugin_loop)
 
 
 async def _await_plugin(coro, timeout: float = 60):
-    """框架侧：提交到插件线程并 await 结果（不阻塞框架 loop）"""
     future = _submit(coro)
     try:
         return await asyncio.wait_for(asyncio.wrap_future(future), timeout)
@@ -196,7 +219,7 @@ async def _await_plugin(coro, timeout: float = 60):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 全局状态（跨线程共享，简单变量读写原子）
+# 全局状态
 # ══════════════════════════════════════════════════════════════════════════
 
 _config: dict = {}
@@ -205,8 +228,7 @@ _wechat_running = False
 _wechat_session: Optional[Dict] = None
 _wechat_initialized = False
 
-# 登录状态
-_login_lock: Optional[asyncio.Lock] = None  # 在插件线程首次提交时惰性创建
+_login_lock: Optional[asyncio.Lock] = None
 _login_in_progress = False
 _login_abort = False
 _login_source = ""
@@ -215,7 +237,6 @@ _current_login_holder: Optional[Dict[str, Any]] = None
 _qr_ready_event: Optional[asyncio.Event] = None
 _login_done_event: Optional[asyncio.Event] = None
 
-# 二维码
 _current_qr_code = ""
 _current_qr_link = ""
 _current_qr_image_base64 = ""
@@ -258,7 +279,6 @@ def _check_and_install_deps():
                if p not in installed
                and p.lower() not in {i.lower() for i in installed}]
     if not missing:
-        log.info("[微信Bot] 依赖已安装")
         return
     log.info(f"[微信Bot] 安装: {missing}")
     try:
@@ -280,15 +300,24 @@ def load_config() -> dict:
     if not os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             yaml.dump(DEFAULT_CONFIG, f, allow_unicode=True, default_flow_style=False)
-    try:
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-            _config = {**DEFAULT_CONFIG, **(yaml.safe_load(f) or {})}
-        for stale in ('base_url', 'wechat_base_url', 'proxy'):
-            _config.pop(stale, None)
-        return _config
-    except Exception:
         _config = dict(DEFAULT_CONFIG)
         return _config
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            raw = yaml.safe_load(f) or {}
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    cfg = {k: raw.get(k, DEFAULT_CONFIG[k]) for k in DEFAULT_CONFIG}
+    if set(raw.keys()) != set(cfg.keys()) or any(raw.get(k) != cfg[k] for k in cfg):
+        try:
+            with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+                yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+        except Exception as e:
+            log.warning(f"[微信Bot] 配置文件规范化失败: {e}")
+    _config = cfg
+    return _config
 
 
 def _read_config_direct() -> dict:
@@ -296,26 +325,26 @@ def _read_config_direct() -> dict:
         return dict(DEFAULT_CONFIG)
     try:
         with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-            cfg = {**DEFAULT_CONFIG, **(yaml.safe_load(f) or {})}
-        for stale in ('base_url', 'wechat_base_url', 'proxy'):
-            cfg.pop(stale, None)
-        return cfg
+            raw = yaml.safe_load(f) or {}
     except Exception:
         return dict(DEFAULT_CONFIG)
+    if not isinstance(raw, dict):
+        return dict(DEFAULT_CONFIG)
+    return {k: raw.get(k, DEFAULT_CONFIG[k]) for k in DEFAULT_CONFIG}
 
 
 def update_config(updates: dict) -> bool:
     global _config
     cfg = _read_config_direct()
-    cfg.update(updates)
-    _config.update(updates)
+    cfg.update({k: v for k, v in updates.items() if k in DEFAULT_CONFIG})
     with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+    _config.update(cfg)
     return True
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 图床
+# 图床 & 通用发图
 # ══════════════════════════════════════════════════════════════════════════
 
 def _get_hosting():
@@ -362,6 +391,32 @@ async def _upload_to_hosting(image_bytes: bytes,
         return url
     log.warning(f"[图床] 上传失败或返回异常: {url!r}")
     return None
+
+
+async def _reply_qq_image(event, image_bytes: bytes, caption: str = "",
+                          filename: str = "image.png") -> bool:
+    """QQ 端发图：优先图床 markdown，失败回退 reply_image"""
+    image_url = await _upload_to_hosting(image_bytes, filename, event=event)
+    if image_url:
+        md = f"![img]({image_url})"
+        if caption:
+            md = f"{caption}\n\n{md}"
+        try:
+            await event.reply(md)
+            return True
+        except Exception as e:
+            log.warning(f"[图床] markdown 发送失败: {e}")
+    try:
+        await event.reply_image(image_bytes, caption or filename)
+        return True
+    except Exception as e:
+        log.error(f"[QQ发图] reply_image 失败: {e}")
+        if caption:
+            try:
+                await event.reply(caption)
+            except Exception:
+                pass
+        return False
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -425,8 +480,11 @@ def generate_qr_image(url: str, size: int = 360) -> bytes:
                        box_size=10, border=2)
     qr.add_data(url)
     qr.make(fit=True)
-    img = qr.make_image(fill_color="black", back_color="white").resize(
-        (size, size), Image.LANCZOS)
+    img = qr.make_image(fill_color="black", back_color="white")
+    if hasattr(img, 'get_image'):
+        img = img.get_image()
+    img = img.convert('RGB')
+    img = img.resize((size, size), Image.LANCZOS)
     buf = BytesIO()
     img.save(buf, format='PNG')
     return buf.getvalue()
@@ -438,13 +496,46 @@ def generate_qr_base64(url: str, size: int = 280) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 微信 API 请求（在插件线程里执行）
+# 微信 API 请求（QR 阶段复用 session）
 # ══════════════════════════════════════════════════════════════════════════
+
+_qr_session: Optional[aiohttp.ClientSession] = None
+_qr_session_node: Optional[str] = None
+
+
+async def _get_qr_session(candidate: Optional[str]) -> aiohttp.ClientSession:
+    global _qr_session, _qr_session_node
+    if (_qr_session is not None
+            and not _qr_session.closed
+            and _qr_session_node == candidate):
+        return _qr_session
+    if _qr_session is not None and not _qr_session.closed:
+        try:
+            await _qr_session.close()
+        except Exception:
+            pass
+    _qr_session = aiohttp.ClientSession(
+        connector=ip_fallback.make_connector(candidate),
+        timeout=aiohttp.ClientTimeout(total=20, connect=10),
+    )
+    _qr_session_node = candidate
+    return _qr_session
+
+
+async def _close_qr_session():
+    global _qr_session, _qr_session_node
+    if _qr_session is not None and not _qr_session.closed:
+        try:
+            await _qr_session.close()
+        except Exception:
+            pass
+    _qr_session = None
+    _qr_session_node = None
+
 
 async def _fetch_qr_code() -> tuple:
     url = f"{WECHAT_BASE_URL}/ilink/bot/get_bot_qrcode?bot_type=3"
-    log.info(f"[微信Bot] → GET {url}")
-    timeout = aiohttp.ClientTimeout(total=15, connect=10)
+    req_timeout = aiohttp.ClientTimeout(total=15, connect=10)
     errors = []
     candidates = ip_fallback.build_candidates(
         ip_fallback.WECHAT_API_HOST,
@@ -452,89 +543,82 @@ async def _fetch_qr_code() -> tuple:
     for candidate in candidates:
         label = candidate or "DNS"
         try:
-            connector = ip_fallback.make_connector(candidate)
-            async with aiohttp.ClientSession(
-                    connector=connector, timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    text = await resp.text()
-                    if resp.status != 200:
-                        errors.append(f"{label}: HTTP {resp.status}")
-                        continue
-                    try:
-                        qr_data = json.loads(text)
-                    except json.JSONDecodeError as e:
-                        errors.append(f"{label}: 非 JSON: {e}")
-                        continue
-                    qrcode_str = qr_data.get("qrcode", "")
-                    if not qrcode_str:
-                        errors.append(f"{label}: 无 qrcode 字段")
-                        continue
-                    qr_link = (qr_data.get("qrcode_img_content")
-                               or f"https://liteapp.weixin.qq.com/q/7GiQu1"
-                                  f"?qrcode={qrcode_str}&bot_type=3")
-                    ip_fallback.set_working_node(
-                        ip_fallback.WECHAT_API_HOST, candidate)
-                    log.info(f"[微信Bot] ✅ 二维码获取成功（{label}）")
-                    return qrcode_str, qr_link
+            session = await _get_qr_session(candidate)
+            async with session.get(url, timeout=req_timeout) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    errors.append(f"{label}: HTTP {resp.status}")
+                    continue
+                try:
+                    qr_data = json.loads(text)
+                except json.JSONDecodeError as e:
+                    errors.append(f"{label}: 非 JSON: {e}")
+                    continue
+                qrcode_str = qr_data.get("qrcode", "")
+                if not qrcode_str:
+                    errors.append(f"{label}: 无 qrcode 字段")
+                    continue
+                qr_link = (qr_data.get("qrcode_img_content")
+                           or f"https://liteapp.weixin.qq.com/q/7GiQu1"
+                              f"?qrcode={qrcode_str}&bot_type=3")
+                ip_fallback.set_working_node(
+                    ip_fallback.WECHAT_API_HOST, candidate)
+                log.info(f"[微信Bot] ✅ 二维码获取成功（{label}）")
+                return qrcode_str, qr_link
+        except asyncio.TimeoutError:
+            errors.append(f"{label}: 超时")
+            continue
         except Exception as e:
             errors.append(f"{label}: {type(e).__name__}: {e}")
             continue
-    raise Exception("所有节点均失败: " + " | ".join(errors))
+    raise Exception("获取二维码失败: " + " | ".join(errors))
 
 
 async def _query_qr_status(qrcode_str: str) -> dict:
+    """轮询二维码状态。
+
+    注意：微信 iLink 的 get_qrcode_status 是长轮询接口，用户扫码前
+    服务端可能不返回响应。单次 5s 超时是正常现象，不应视为错误。
+    所有候选节点都超时时返回 {"status": "wait", "_timeout": True}。
+    """
     url = f"{WECHAT_BASE_URL}/ilink/bot/get_qrcode_status"
     params = {"qrcode": qrcode_str}
-    timeout = aiohttp.ClientTimeout(total=15, connect=10)
+    req_timeout = aiohttp.ClientTimeout(total=5, connect=3)
     errors = []
+    timed_out = 0
     candidates = ip_fallback.build_candidates(
         ip_fallback.WECHAT_API_HOST,
         ip_fallback.WECHAT_API_FALLBACK_IPS)
     for candidate in candidates:
         label = candidate or "DNS"
         try:
-            connector = ip_fallback.make_connector(candidate)
-            async with aiohttp.ClientSession(
-                    connector=connector, timeout=timeout) as session:
-                async with session.get(url, params=params) as resp:
-                    text = await resp.text()
-                    if resp.status != 200:
-                        errors.append(f"{label}: HTTP {resp.status}")
-                        continue
-                    data = json.loads(text)
-                    ip_fallback.set_working_node(
-                        ip_fallback.WECHAT_API_HOST, candidate)
-                    return data
+            session = await _get_qr_session(candidate)
+            async with session.get(url, params=params,
+                                   timeout=req_timeout) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    errors.append(f"{label}: HTTP {resp.status}")
+                    continue
+                data = json.loads(text)
+                ip_fallback.set_working_node(
+                    ip_fallback.WECHAT_API_HOST, candidate)
+                return data
+        except asyncio.TimeoutError:
+            timed_out += 1
+            errors.append(f"{label}: 超时")
+            continue
         except Exception as e:
             errors.append(f"{label}: {type(e).__name__}: {e}")
             continue
-    # 所有节点失败 → 等 1 秒重试一次
-    log.debug(f"[QR状态] 首次失败，重试: {' | '.join(errors)}")
-    await asyncio.sleep(1)
-    for candidate in candidates:
-        label = candidate or "DNS"
-        try:
-            connector = ip_fallback.make_connector(candidate)
-            async with aiohttp.ClientSession(
-                    connector=connector, timeout=timeout) as session:
-                async with session.get(url, params=params) as resp:
-                    text = await resp.text()
-                    if resp.status != 200:
-                        errors.append(f"retry {label}: HTTP {resp.status}")
-                        continue
-                    data = json.loads(text)
-                    ip_fallback.set_working_node(
-                        ip_fallback.WECHAT_API_HOST, candidate)
-                    return data
-        except Exception as e:
-            errors.append(f"retry {label}: {type(e).__name__}: {e}")
-            continue
-    
-    raise Exception("所有节点均失败（含重试）: " + " | ".join(errors))
 
+    # 所有候选都超时 → 长轮询挂起（用户未扫码），正常返回 wait
+    if timed_out == len(candidates) and timed_out > 0:
+        return {"status": "wait", "_timeout": True}
+
+    raise Exception("二维码状态查询失败: " + " | ".join(errors))
 
 # ══════════════════════════════════════════════════════════════════════════
-# 统一登录流程（在插件线程里跑）
+# 统一登录流程
 # ══════════════════════════════════════════════════════════════════════════
 
 async def _do_login_background(qr_ev: asyncio.Event,
@@ -545,7 +629,7 @@ async def _do_login_background(qr_ev: asyncio.Event,
     global _wechat_session, _wechat_task, _wechat_running
     try:
         if _login_abort:
-            holder.update({"ok": False, "msg": "登录已被用户终止"})
+            holder.update({"ok": False, "msg": "登录已被用户终止", "user_friendly": True})
             qr_ev.set(); done_ev.set()
             return
 
@@ -553,7 +637,7 @@ async def _do_login_background(qr_ev: asyncio.Event,
             qrcode_str, qr_link = await _fetch_qr_code()
         except Exception as e:
             log.error(f"[微信Bot] 获取二维码失败: {e}")
-            holder.update({"ok": False, "msg": f"获取二维码失败: {e}"})
+            holder.update({"ok": False, "msg": f"获取二维码失败: {e}", "user_friendly": True})
             qr_ev.set(); done_ev.set()
             return
 
@@ -566,31 +650,38 @@ async def _do_login_background(qr_ev: asyncio.Event,
 
         deadline = time.time() + 5 * 60
         refresh_count = 0
+        scanned_logged = False
         current_qr = qrcode_str
 
         while time.time() < deadline:
             if _login_abort:
-                holder.update({"ok": False, "msg": "登录已被用户终止"})
+                holder.update({"ok": False, "msg": "登录已被用户终止", "user_friendly": True})
                 done_ev.set()
                 return
             try:
                 status_data = await _query_qr_status(current_qr)
             except Exception as e:
                 if _login_abort:
-                    holder.update({"ok": False, "msg": "登录已被用户终止"})
+                    holder.update({"ok": False, "msg": "登录已被用户终止", "user_friendly": True})
                     done_ev.set()
                     return
-                log.error(f"[微信Bot] 查询二维码状态出错: {e}")
-                await asyncio.sleep(2)
+                log.warning(f"[微信Bot] 查询二维码状态失败（将重试）: {e}")
+                await asyncio.sleep(1)
                 continue
 
             status = status_data.get("status", "wait")
+
             if status == "scaned":
-                log.info("[微信Bot] 👀 已扫码")
-            elif status == "expired":
+                if not scanned_logged:
+                    log.info("[微信Bot] 👀 已扫码，等待确认")
+                    scanned_logged = True
+                await asyncio.sleep(1)
+                continue
+
+            if status == "expired":
                 refresh_count += 1
                 if refresh_count > 1:
-                    holder.update({"ok": False, "msg": "二维码多次过期"})
+                    holder.update({"ok": False, "msg": "二维码多次过期", "user_friendly": True})
                     done_ev.set()
                     return
                 try:
@@ -600,10 +691,17 @@ async def _do_login_background(qr_ev: asyncio.Event,
                     _current_qr_link = new_link
                     _current_qr_image_base64 = generate_qr_base64(new_link)
                     _qr_generated_at = time.time()
+                    scanned_logged = False
+                    log.info(f"[微信Bot] 🔄 二维码已刷新: {new_link}")
                     qr_ev.set()
+                    # 让 QQ 侧的 cmd_wechat_login / cmd_wechat_restart
+                    # 通过 _wait_qr_event_async 感知到 _current_qr_link 变化
                 except Exception as e:
                     log.error(f"[微信Bot] 刷新二维码失败: {e}")
-            elif status == "confirmed":
+                await asyncio.sleep(2)
+                continue
+
+            if status == "confirmed":
                 log.info("[微信Bot] ✅ 登录成功")
                 token_data = {
                     "token": status_data["bot_token"],
@@ -619,13 +717,14 @@ async def _do_login_background(qr_ev: asyncio.Event,
                 holder.update({"ok": True, "msg": "登录成功", "token": token_data})
                 done_ev.set()
                 return
-            await asyncio.sleep(1)
 
-        holder.update({"ok": False, "msg": "登录超时"})
+            await asyncio.sleep(3)
+
+        holder.update({"ok": False, "msg": "登录超时", "user_friendly": True})
         done_ev.set()
     except Exception as e:
-        log.exception("[微信Bot] 登录后台任务异常")
-        holder.update({"ok": False, "msg": f"内部错误: {e}"})
+        log.exception(f"[微信Bot] 登录后台任务异常，内部错误{e}")
+        holder.update({"ok": False, "msg": f"内部错误: {e}", "user_friendly": False})
         try:
             qr_ev.set(); done_ev.set()
         except Exception:
@@ -633,10 +732,15 @@ async def _do_login_background(qr_ev: asyncio.Event,
     finally:
         _login_in_progress = False
         _login_source = ""
+        try:
+            await asyncio.shield(_close_qr_session())
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
 
 
 async def _start_login_async(source: str):
-    """在插件线程执行。返回 (started: bool, msg: str)"""
     global _login_lock, _login_in_progress, _login_abort, _login_source
     global _login_future, _current_login_holder
     global _qr_ready_event, _login_done_event
@@ -693,6 +797,48 @@ async def _wait_login_done(timeout: float = 360) -> Dict:
     return dict(holder)
 
 
+async def _wait_qr_event_async(after_link: str, timeout: float = 350) -> Dict:
+    """★ v1.0.4 新增：在插件线程等待二维码刷新或登录完成。
+
+    - after_link：调用方已经发送给用户的最后一张二维码链接
+    - 返回值：
+        {"type": "done", "holder": {...}}
+        {"type": "refreshed", "qr_link": str, "qr_image": str}
+        {"type": "timeout"}
+    """
+    deadline = time.time() + timeout
+
+    def _check():
+        if _login_done_event is not None and _login_done_event.is_set():
+            holder = (dict(_current_login_holder)
+                      if _current_login_holder is not None
+                      else {"ok": False, "msg": "无登录进程"})
+            return {"type": "done", "holder": holder}
+        if _current_qr_link and _current_qr_link != after_link:
+            return {
+                "type": "refreshed",
+                "qr_link": _current_qr_link,
+                "qr_image": _current_qr_image_base64,
+            }
+        return None
+
+    # 立即检查一次，避免错过已经发生的事件
+    r = _check()
+    if r is not None:
+        return r
+
+    while time.time() < deadline:
+        await asyncio.sleep(0.5)
+        r = _check()
+        if r is not None:
+            return r
+    return {"type": "timeout"}
+
+
+async def _is_login_in_progress_async() -> bool:
+    return _login_in_progress
+
+
 async def _get_qr_info() -> Dict:
     return {
         "qr_code": _current_qr_code,
@@ -703,12 +849,15 @@ async def _get_qr_info() -> Dict:
 
 
 async def _do_stop_wechat():
-    """在插件线程执行停止"""
     global _wechat_running, _wechat_task, _wechat_session
     global _login_abort, _login_in_progress, _login_future
     global _qr_ready_event, _login_done_event, _current_login_holder
 
     if not _wechat_running and not _login_in_progress:
+        try:
+            await _close_qr_session()
+        except Exception:
+            pass
         return False, "未在运行"
 
     _login_abort = True
@@ -721,12 +870,16 @@ async def _do_stop_wechat():
             await _login_future
         except asyncio.CancelledError:
             pass
+        except Exception:
+            pass
 
     if _wechat_task:
         _wechat_task.cancel()
         try:
             await _wechat_task
         except asyncio.CancelledError:
+            pass
+        except Exception:
             pass
 
     _wechat_session = None
@@ -740,13 +893,18 @@ async def _do_stop_wechat():
         try: _login_done_event.set()
         except Exception: pass
     if _current_login_holder is not None:
-        _current_login_holder.update({"ok": False, "msg": "已终止"})
+        _current_login_holder.update({"ok": False, "msg": "已终止", "user_friendly": True})
+
+    try:
+        await _close_qr_session()
+    except Exception:
+        pass
 
     return True, "已停止"
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 消息循环（在插件线程里跑）
+# 消息循环
 # ══════════════════════════════════════════════════════════════════════════
 
 async def wechat_main_loop(session_data: Dict):
@@ -782,7 +940,7 @@ async def wechat_main_loop(session_data: Dict):
                     continue
                 if context_token:
                     _save_context_token(msg.from_user_id, context_token)
-                log.info(f"[微信消息] 收到: {text[:50]}")
+                #log.info(f"[微信消息] 收到: {text[:50]}")
                 handler_, args = WechatCommand.match(text)
                 if handler_:
                     await handler_(sender, msg.from_user_id, context_token, args)
@@ -815,7 +973,7 @@ async def wechat_main_loop(session_data: Dict):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# 高层业务 API（提交到插件线程执行）
+# 高层业务 API
 # ══════════════════════════════════════════════════════════════════════════
 
 async def _api_get_state_async() -> dict:
@@ -838,6 +996,15 @@ async def _api_get_state_async() -> dict:
         bot_status = 'stopped'
     else:
         bot_status = 'no_token'
+    # ★ 新增：最近一次登录失败原因
+    last_error = ""
+    last_error_friendly = True
+    holder = _current_login_holder
+    if (holder is not None
+            and holder.get("ok") is False
+            and not _login_in_progress):
+        last_error = holder.get("msg", "")
+        last_error_friendly = holder.get("user_friendly", True)
     return {
         'config': cfg,
         'wechat_base_url': WECHAT_BASE_URL,
@@ -851,11 +1018,11 @@ async def _api_get_state_async() -> dict:
         'qr_image': _current_qr_image_base64,
         'qr_generated_at': _qr_generated_at,
         'login_source': _login_source,
+        'last_error': last_error,                    # ★ 新增
+        'last_error_friendly': last_error_friendly,  # ★ 新增
     }
 
-
 async def _api_start_async():
-    """Web 端启动：有 token 直接启动；无 token 启动登录流程"""
     global _wechat_session, _wechat_task, _wechat_running
     if _wechat_running:
         return {'ok': False, 'message': '已在运行中', 'need_login': False,
@@ -868,7 +1035,6 @@ async def _api_start_async():
         return {'ok': True, 'message': '已启动（复用 token）',
                 'need_login': False}
     started, msg = await _start_login_async("web")
-    # ★ 登录已在进行中也视为"可继续"，通过 reason 区分
     if not started and "已在进行中" in msg:
         return {'ok': True, 'message': msg, 'need_login': True,
                 'reason': 'already_logging_in'}
@@ -903,12 +1069,12 @@ async def _api_abort_login_async():
         try: _login_done_event.set()
         except Exception: pass
     if _current_login_holder is not None:
-        _current_login_holder.update({"ok": False, "msg": "已终止"})
+        _current_login_holder.update({"ok": False, "msg": "已终止", "user_friendly": True})
     return {'ok': True, 'message': '已终止'}
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Web API（框架线程 → 提交到插件线程）
+# Web API
 # ══════════════════════════════════════════════════════════════════════════
 
 @register_route('GET', '/api/ext/wechat/login-qr', auth=False)
@@ -925,7 +1091,7 @@ async def api_get_login_status(request):
     if not qrcode_str:
         return web.json_response({'ok': False, 'message': '缺少qrcode参数'}, status=400)
     try:
-        status_data = await _await_plugin(_query_qr_status(qrcode_str), timeout=20)
+        status_data = await _await_plugin(_query_qr_status(qrcode_str), timeout=10)
         return web.json_response(
             {'ok': True, 'data': {'status': status_data.get('status', 'wait')}})
     except Exception as e:
@@ -951,12 +1117,15 @@ async def api_save_config(request):
     from aiohttp import web
     try:
         body = await request.json()
-        keys = ['use_image', 'use_background', 'auto_login']
+        keys = ['use_image', 'use_background', 'auto_login', 'use_ip_fallback']
         updates = {k: bool(body[k]) for k in keys if k in body}
         if not updates:
             return web.json_response({'ok': False, 'message': '无有效配置'}, status=400)
         update_config(updates)
-        log.info(f"[微信Bot] 配置已更新: {updates}")
+        if 'use_ip_fallback' in updates:
+            ip_fallback.set_use_fallback(updates['use_ip_fallback'])
+            log.info(f"[微信Bot] IP fallback: "
+                     f"{'开' if updates['use_ip_fallback'] else '关'}")
         return web.json_response({'ok': True, 'message': '已保存', 'data': updates})
     except Exception as e:
         return web.json_response({'ok': False, 'message': str(e)}, status=400)
@@ -980,11 +1149,82 @@ async def api_stop(request):
 async def api_start(request):
     from aiohttp import web
     result = await _await_plugin(_api_start_async(), timeout=15)
+    if result.get('need_login'):
+        try:
+            info = await _await_plugin(_get_qr_info(), timeout=3)
+            result['qr_code'] = info.get('qr_code', '')
+            result['qr_url'] = info.get('qr_url', '')
+            result['qr_image'] = info.get('qr_image', '')
+        except Exception:
+            pass
     return web.json_response(result)
 
 
+@register_route('POST', '/api/ext/wechat/send-image', auth=False)
+async def api_send_image(request):
+    from aiohttp import web
+
+    if not _wechat_running or not _wechat_session:
+        return web.json_response({'ok': False, 'message': '微信 Bot 未运行'},
+                                 status=400)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({'ok': False, 'message': '请求体必须为 JSON'},
+                                 status=400)
+
+    image_b64 = (body.get('image') or '').strip()
+    if not image_b64:
+        return web.json_response({'ok': False, 'message': '缺少 image 字段'},
+                                 status=400)
+    if image_b64.startswith('data:'):
+        try:
+            image_b64 = image_b64.split(',', 1)[1]
+        except Exception:
+            return web.json_response({'ok': False, 'message': 'data URI 格式错误'},
+                                     status=400)
+    try:
+        image_data = base64.b64decode(image_b64)
+    except Exception as e:
+        return web.json_response({'ok': False, 'message': f'base64 解码失败: {e}'},
+                                 status=400)
+    if not image_data:
+        return web.json_response({'ok': False, 'message': '图片数据为空'},
+                                 status=400)
+    if len(image_data) > 10 * 1024 * 1024:
+        return web.json_response({'ok': False, 'message': '图片过大（>10MB）'},
+                                 status=400)
+
+    to_user_id = body.get('to_user_id') or ''
+    context_token = body.get('context_token') or ''
+    if not to_user_id or not context_token:
+        try:
+            with open(WECHAT_TOKEN_FILE, 'r', encoding='utf-8') as f:
+                td = json.load(f)
+            to_user_id = to_user_id or td.get('last_user_id') or td.get('userId') or ''
+            context_token = context_token or td.get('context_token') or ''
+        except Exception:
+            pass
+    if not to_user_id:
+        return web.json_response(
+            {'ok': False, 'message': '无目标用户（请先在微信端发一条消息）'},
+            status=400)
+
+    client = WeixinApiClient(_wechat_session["baseUrl"], _wechat_session["token"])
+    sender = WeixinMessageSender(client)
+    try:
+        result = await sender.send_image(to_user_id, image_data, context_token)
+    finally:
+        await sender.close()
+
+    if result.get('ok'):
+        return web.json_response({'ok': True, 'message': '已发送', 'data': result})
+    return web.json_response(
+        {'ok': False, 'message': result.get('error', '发送失败')}, status=500)
+
+
 # ══════════════════════════════════════════════════════════════════════════
-# Web 页面（保持你当前的浅色版，一字不改）
+# Web 页面（含 IP Fallback 开关）
 # ══════════════════════════════════════════════════════════════════════════
 
 CONFIG_PAGE_HTML = r'''<!DOCTYPE html>
@@ -995,319 +1235,121 @@ CONFIG_PAGE_HTML = r'''<!DOCTYPE html>
 <title>微信 Bot 配置</title>
 <style>
 :root{
-  --bg:#f6f7fb;
-  --bg-glow-1:rgba(124,93,255,.12);
-  --bg-glow-2:rgba(91,140,255,.10);
-  --panel:#ffffff;
-  --panel-inner:#f8f9fc;
-  --border:#e6e8ef;
-  --border-2:#d8dbe5;
-  --border-focus:rgba(124,93,255,.45);
-  --text:#171a2e;
-  --text-dim:#5b6076;
-  --text-muted:#9599ad;
-  --accent-1:#7c5dff;
-  --accent-2:#5b8cff;
-  --accent-soft:rgba(124,93,255,.08);
-  --success:#10b981;
-  --success-soft:rgba(16,185,129,.1);
-  --danger:#ef4444;
-  --danger-soft:rgba(239,68,68,.08);
-  --warn:#f59e0b;
-  --radius-lg:16px;
-  --radius:12px;
-  --radius-sm:10px;
-  --radius-xs:8px;
+  --bg:#f6f7fb;--bg-glow-1:rgba(124,93,255,.12);--bg-glow-2:rgba(91,140,255,.10);
+  --panel:#ffffff;--panel-inner:#f8f9fc;--border:#e6e8ef;--border-2:#d8dbe5;
+  --border-focus:rgba(124,93,255,.45);--text:#171a2e;--text-dim:#5b6076;
+  --text-muted:#9599ad;--accent-1:#7c5dff;--accent-2:#5b8cff;
+  --accent-soft:rgba(124,93,255,.08);--success:#10b981;--success-soft:rgba(16,185,129,.1);
+  --danger:#ef4444;--danger-soft:rgba(239,68,68,.08);--warn:#f59e0b;
+  --radius-lg:16px;--radius:12px;--radius-sm:10px;--radius-xs:8px;
   --shadow-sm:0 1px 2px rgba(23,26,46,.04),0 1px 3px rgba(23,26,46,.03);
   --shadow:0 2px 8px rgba(23,26,46,.05),0 4px 16px rgba(23,26,46,.04);
   --shadow-lg:0 8px 24px rgba(23,26,46,.08),0 16px 48px rgba(23,26,46,.06);
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{height:100%}
-body{
-  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',system-ui,sans-serif;
-  background:var(--bg);
-  color:var(--text);
-  line-height:1.6;
-  padding:40px 20px 80px;
-  min-height:100vh;
-  -webkit-font-smoothing:antialiased;
-  -moz-osx-font-smoothing:grayscale;
-  position:relative;
-  overflow-x:hidden;
-}
-body::before,body::after{
-  content:'';position:fixed;border-radius:50%;filter:blur(120px);
-  pointer-events:none;z-index:0;
-}
-body::before{
-  width:560px;height:560px;background:var(--bg-glow-1);
-  top:-200px;left:-120px;
-}
-body::after{
-  width:480px;height:480px;background:var(--bg-glow-2);
-  top:30%;right:-140px;
-}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei',system-ui,sans-serif;
+  background:var(--bg);color:var(--text);line-height:1.6;padding:40px 20px 80px;min-height:100vh;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;position:relative;overflow-x:hidden;}
+body::before,body::after{content:'';position:fixed;border-radius:50%;filter:blur(120px);pointer-events:none;z-index:0;}
+body::before{width:560px;height:560px;background:var(--bg-glow-1);top:-200px;left:-120px;}
+body::after{width:480px;height:480px;background:var(--bg-glow-2);top:30%;right:-140px;}
 .container{max-width:860px;margin:0 auto;position:relative;z-index:1}
-
-/* Hero */
 .hero{display:flex;align-items:center;gap:16px;margin-bottom:28px;padding:0 4px}
-.hero-icon{
-  width:56px;height:56px;border-radius:16px;
-  display:flex;align-items:center;justify-content:center;font-size:28px;
-  background:linear-gradient(135deg,#7c5dff,#5b8cff);
-  box-shadow:0 8px 24px rgba(124,93,255,.25),inset 0 1px 0 rgba(255,255,255,.3);
-  flex-shrink:0;
-}
-.hero-text h1{
-  font-size:24px;font-weight:700;letter-spacing:-.3px;
-  color:var(--text);
-}
+.hero-icon{width:56px;height:56px;border-radius:16px;display:flex;align-items:center;justify-content:center;font-size:28px;
+  background:linear-gradient(135deg,#7c5dff,#5b8cff);box-shadow:0 8px 24px rgba(124,93,255,.25),inset 0 1px 0 rgba(255,255,255,.3);flex-shrink:0;}
+.hero-text h1{font-size:24px;font-weight:700;letter-spacing:-.3px;color:var(--text);}
 .hero-text p{color:var(--text-dim);font-size:13px;margin-top:2px}
-
-/* Card */
-.card{
-  background:var(--panel);
-  border:1px solid var(--border);
-  border-radius:var(--radius-lg);
-  padding:24px;margin-bottom:16px;
-  box-shadow:var(--shadow-sm);
-  transition:box-shadow .2s ease,border-color .2s ease,transform .2s ease;
-}
-.card:hover{
-  box-shadow:var(--shadow);
-  border-color:var(--border-2);
-}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius-lg);padding:24px;margin-bottom:16px;
+  box-shadow:var(--shadow-sm);transition:box-shadow .2s ease,border-color .2s ease,transform .2s ease;}
+.card:hover{box-shadow:var(--shadow);border-color:var(--border-2);}
 .card-head{display:flex;align-items:center;gap:12px;margin-bottom:20px}
-.card-icon{
-  width:38px;height:38px;border-radius:11px;
-  display:flex;align-items:center;justify-content:center;font-size:18px;
-  flex-shrink:0;
-  background:linear-gradient(135deg,rgba(124,93,255,.1),rgba(91,140,255,.1));
-  border:1px solid rgba(124,93,255,.1);
-}
-.card-icon.config-icon{
-  background:linear-gradient(135deg,rgba(16,185,129,.1),rgba(91,140,255,.1));
-  border-color:rgba(16,185,129,.1);
-}
+.card-icon{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0;
+  background:linear-gradient(135deg,rgba(124,93,255,.1),rgba(91,140,255,.1));border:1px solid rgba(124,93,255,.1);}
+.card-icon.config-icon{background:linear-gradient(135deg,rgba(16,185,129,.1),rgba(91,140,255,.1));border-color:rgba(16,185,129,.1);}
 .card-title{flex:1;min-width:0}
 .card-title h2{font-size:15px;font-weight:600;color:var(--text);letter-spacing:-.1px}
 .card-title p{font-size:12px;color:var(--text-muted);margin-top:1px}
-
-/* Status Badge */
-.status-badge{
-  display:inline-flex;align-items:center;gap:8px;
-  padding:6px 14px;border-radius:999px;
-  font-size:13px;font-weight:500;
-  white-space:nowrap;border:1px solid transparent;
-  transition:all .3s ease;
-}
+.status-badge{display:inline-flex;align-items:center;gap:8px;padding:6px 14px;border-radius:999px;font-size:13px;font-weight:500;
+  white-space:nowrap;border:1px solid transparent;transition:all .3s ease;}
 .status-badge .dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
-.status-running{
-  background:var(--success-soft);color:var(--success);
-  border-color:rgba(16,185,129,.2);
-}
-.status-running .dot{
-  background:var(--success);
-  box-shadow:0 0 0 3px rgba(16,185,129,.15);
-  animation:pulse-success 2s ease-in-out infinite;
-}
-.status-stopped{
-  background:var(--danger-soft);color:var(--danger);
-  border-color:rgba(239,68,68,.2);
-}
+.status-running{background:var(--success-soft);color:var(--success);border-color:rgba(16,185,129,.2);}
+.status-running .dot{background:var(--success);box-shadow:0 0 0 3px rgba(16,185,129,.15);animation:pulse-success 2s ease-in-out infinite;}
+.status-stopped{background:var(--danger-soft);color:var(--danger);border-color:rgba(239,68,68,.2);}
 .status-stopped .dot{background:var(--danger)}
-.status-loading{
-  background:var(--accent-soft);color:var(--accent-1);
-  border-color:rgba(124,93,255,.2);
-}
-.status-loading .dot{
-  background:var(--accent-1);
-  animation:pulse-accent 1.4s ease-in-out infinite;
-}
-@keyframes pulse-success{
-  0%,100%{box-shadow:0 0 0 3px rgba(16,185,129,.15)}
-  50%{box-shadow:0 0 0 6px rgba(16,185,129,.04)}
-}
-@keyframes pulse-accent{
-  0%,100%{box-shadow:0 0 0 3px rgba(124,93,255,.15)}
-  50%{box-shadow:0 0 0 6px rgba(124,93,255,.04)}
-}
-
-/* Buttons */
-.btn{
-  display:inline-flex;align-items:center;justify-content:center;gap:8px;
-  padding:10px 18px;border:none;border-radius:var(--radius-sm);
-  font-size:14px;font-weight:500;font-family:inherit;cursor:pointer;
-  white-space:nowrap;
-  transition:all .18s cubic-bezier(.4,0,.2,1);
-}
+.status-loading{background:var(--accent-soft);color:var(--accent-1);border-color:rgba(124,93,255,.2);}
+.status-loading .dot{background:var(--accent-1);animation:pulse-accent 1.4s ease-in-out infinite;}
+@keyframes pulse-success{0%,100%{box-shadow:0 0 0 3px rgba(16,185,129,.15)}50%{box-shadow:0 0 0 6px rgba(16,185,129,.04)}}
+@keyframes pulse-accent{0%,100%{box-shadow:0 0 0 3px rgba(124,93,255,.15)}50%{box-shadow:0 0 0 6px rgba(124,93,255,.04)}}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 18px;border:none;border-radius:var(--radius-sm);
+  font-size:14px;font-weight:500;font-family:inherit;cursor:pointer;white-space:nowrap;transition:all .18s cubic-bezier(.4,0,.2,1);}
 .btn:active:not(:disabled){transform:translateY(1px) scale(.99)}
 .btn:disabled{opacity:.45;cursor:not-allowed}
-.btn-primary{
-  background:linear-gradient(135deg,var(--accent-1),var(--accent-2));
-  color:#fff;
-  box-shadow:0 4px 12px rgba(124,93,255,.25),inset 0 1px 0 rgba(255,255,255,.2);
-}
-.btn-primary:hover:not(:disabled){
-  box-shadow:0 6px 18px rgba(124,93,255,.35),inset 0 1px 0 rgba(255,255,255,.25);
-  transform:translateY(-1px);
-}
+.btn-primary{background:linear-gradient(135deg,var(--accent-1),var(--accent-2));color:#fff;
+  box-shadow:0 4px 12px rgba(124,93,255,.25),inset 0 1px 0 rgba(255,255,255,.2);}
+.btn-primary:hover:not(:disabled){box-shadow:0 6px 18px rgba(124,93,255,.35),inset 0 1px 0 rgba(255,255,255,.25);transform:translateY(-1px);}
 .btn-primary:active:not(:disabled){transform:translateY(0) scale(.99)}
-.btn-danger{
-  background:rgba(239,68,68,.06);color:var(--danger);
-  border:1px solid rgba(239,68,68,.2);
-}
-.btn-danger:hover:not(:disabled){
-  background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.35);
-}
-.btn-ghost{
-  background:var(--panel-inner);color:var(--text);
-  border:1px solid var(--border-2);
-}
-.btn-ghost:hover:not(:disabled){
-  border-color:var(--border-focus);color:var(--accent-1);
-  background:var(--accent-soft);
-}
+.btn-danger{background:rgba(239,68,68,.06);color:var(--danger);border:1px solid rgba(239,68,68,.2);}
+.btn-danger:hover:not(:disabled){background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.35);}
+.btn-ghost{background:var(--panel-inner);color:var(--text);border:1px solid var(--border-2);}
+.btn-ghost:hover:not(:disabled){border-color:var(--border-focus);color:var(--accent-1);background:var(--accent-soft);}
 .btn-sm{padding:7px 14px;font-size:13px}
 .btn-group{display:flex;gap:10px;flex-wrap:wrap}
-
-/* Session Info */
-.session-info{
-  background:var(--panel-inner);border:1px solid var(--border);
-  border-radius:var(--radius-sm);padding:14px 18px;margin-top:14px;
-  display:grid;grid-template-columns:auto 1fr;gap:6px 20px;font-size:13px;
-  animation:fadeSlide .3s ease;
-}
+.session-info{background:var(--panel-inner);border:1px solid var(--border);border-radius:var(--radius-sm);padding:14px 18px;margin-top:14px;
+  display:grid;grid-template-columns:auto 1fr;gap:6px 20px;font-size:13px;animation:fadeSlide .3s ease;}
 .session-info .k{color:var(--text-muted);font-size:12px;display:flex;align-items:center}
-.session-info .v{
-  font-family:'JetBrains Mono','SF Mono',Consolas,monospace;
-  color:var(--text);font-size:12px;word-break:break-all;
-}
+.session-info .v{font-family:'JetBrains Mono','SF Mono',Consolas,monospace;color:var(--text);font-size:12px;word-break:break-all;}
 @keyframes fadeSlide{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
-
-/* Login Area */
-.login-area{
-  display:none;margin-top:18px;padding:24px;
-  background:var(--panel-inner);border:1px solid var(--border);
-  border-radius:var(--radius);
-}
+.login-area{display:none;margin-top:18px;padding:24px;background:var(--panel-inner);border:1px solid var(--border);border-radius:var(--radius);}
 .login-area.show{display:block;animation:slideDown .3s cubic-bezier(.4,0,.2,1)}
 @keyframes slideDown{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:none}}
 .qr-wrap{display:flex;justify-content:center;align-items:center;margin-bottom:16px;min-height:60px}
-.qr-wrap img{
-  width:220px;height:220px;border-radius:14px;
-  border:1px solid rgba(124,93,255,.15);background:#fff;padding:10px;
-  image-rendering:pixelated;
-  box-shadow:0 8px 32px rgba(23,26,46,.1),0 0 0 6px rgba(124,93,255,.04);
-  animation:qrIn .4s cubic-bezier(.4,0,.2,1);
-}
+.qr-wrap img{width:220px;height:220px;border-radius:14px;border:1px solid rgba(124,93,255,.15);background:#fff;padding:10px;
+  image-rendering:pixelated;box-shadow:0 8px 32px rgba(23,26,46,.1),0 0 0 6px rgba(124,93,255,.04);animation:qrIn .4s cubic-bezier(.4,0,.2,1);}
 @keyframes qrIn{from{opacity:0;transform:scale(.95)}to{opacity:1;transform:scale(1)}}
-.qr-wrap .spinner{
-  width:40px;height:40px;
-  border:3px solid rgba(124,93,255,.12);
-  border-top-color:var(--accent-1);border-radius:50%;
-  animation:spin .8s linear infinite;
-}
-.login-status{
-  text-align:center;font-size:13px;color:var(--text-dim);
-  margin-bottom:14px;font-weight:500;
-}
-.link-box{
-  display:flex;align-items:center;gap:10px;
-  background:#fff;border:1px solid var(--border);
-  border-radius:var(--radius-xs);padding:10px 14px;margin-bottom:14px;
-  font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);
-}
+.qr-wrap .spinner{width:40px;height:40px;border:3px solid rgba(124,93,255,.12);border-top-color:var(--accent-1);
+  border-radius:50%;animation:spin .8s linear infinite;}
+.login-status{text-align:center;font-size:13px;color:var(--text-dim);margin-bottom:14px;font-weight:500;}
+.login-error{display:none;margin-top:14px;padding:12px 16px;background:#fef2f2;border:1px solid rgba(239,68,68,.3);border-radius:var(--radius-sm);color:#b91c1c;font-size:13px;line-height:1.6;animation:slideDown .3s cubic-bezier(.4,0,.2,1);}
+.login-error.show{display:block}
+.link-box{display:flex;align-items:center;gap:10px;background:#fff;border:1px solid var(--border);border-radius:var(--radius-xs);
+  padding:10px 14px;margin-bottom:14px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-dim);}
 .link-box > span:first-child{opacity:.5;flex-shrink:0}
-.link-box .text{
-  flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:all;
-}
-
-/* Toggle */
-.toggle-row{
-  display:flex;align-items:center;justify-content:space-between;gap:16px;
-  padding:14px 0;border-top:1px solid var(--border);
-}
+.link-box .text{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:all;}
+.toggle-row{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 0;border-top:1px solid var(--border);}
 .toggle-row:first-of-type{border-top:none;padding-top:0}
 .toggle-row:last-of-type{padding-bottom:0}
 .toggle-info .title{font-size:14px;font-weight:500;color:var(--text)}
 .toggle-info .desc{font-size:12px;color:var(--text-muted);margin-top:2px}
-
-.switch{
-  position:relative;width:44px;height:24px;flex-shrink:0;
-  cursor:pointer;display:inline-block;
-}
+.switch{position:relative;width:44px;height:24px;flex-shrink:0;cursor:pointer;display:inline-block;}
 .switch input{display:none}
-.switch .track{
-  position:absolute;inset:0;background:#e4e6ee;
-  border:1px solid transparent;border-radius:999px;cursor:pointer;
-  transition:all .2s ease;
-}
-.switch .track::after{
-  content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;
-  background:#fff;border-radius:50%;
-  transition:transform .2s cubic-bezier(.4,0,.2,1);
-  box-shadow:0 1px 3px rgba(0,0,0,.15);
-}
-.switch input:checked + .track{
-  background:linear-gradient(135deg,var(--accent-1),var(--accent-2));
-  box-shadow:0 2px 10px rgba(124,93,255,.3);
-}
+.switch .track{position:absolute;inset:0;background:#e4e6ee;border:1px solid transparent;border-radius:999px;cursor:pointer;transition:all .2s ease;}
+.switch .track::after{content:'';position:absolute;width:16px;height:16px;left:3px;top:3px;background:#fff;border-radius:50%;
+  transition:transform .2s cubic-bezier(.4,0,.2,1);box-shadow:0 1px 3px rgba(0,0,0,.15);}
+.switch input:checked + .track{background:linear-gradient(135deg,var(--accent-1),var(--accent-2));box-shadow:0 2px 10px rgba(124,93,255,.3);}
 .switch input:checked + .track::after{transform:translateX(20px)}
 .switch.saving .track{opacity:.6}
-
-/* Toast */
-.toast{
-  position:fixed;top:24px;right:24px;z-index:9999;
-  padding:12px 20px;border-radius:var(--radius-sm);
-  font-size:14px;font-weight:500;
-  box-shadow:var(--shadow-lg);
-  opacity:0;transform:translateX(24px) scale(.98);
-  pointer-events:none;
-  transition:all .25s cubic-bezier(.4,0,.2,1);
-  max-width:360px;
-  background:#fff;border:1px solid var(--border);
-}
+.toast{position:fixed;top:24px;right:24px;z-index:9999;padding:12px 20px;border-radius:var(--radius-sm);font-size:14px;font-weight:500;
+  box-shadow:var(--shadow-lg);opacity:0;transform:translateX(24px) scale(.98);pointer-events:none;
+  transition:all .25s cubic-bezier(.4,0,.2,1);max-width:360px;background:#fff;border:1px solid var(--border);}
 .toast.show{opacity:1;transform:none;pointer-events:auto}
 .toast-success{color:#047857;border-color:rgba(16,185,129,.3);background:#ecfdf5}
 .toast-error{color:#b91c1c;border-color:rgba(239,68,68,.3);background:#fef2f2}
 .toast-info{color:#4338ca;border-color:rgba(124,93,255,.3);background:#eef2ff}
-
-/* Modal */
-.modal-mask{
-  position:fixed;inset:0;background:rgba(23,26,46,.4);
-  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
-  display:none;align-items:center;justify-content:center;
-  z-index:1000;padding:20px;
-}
+.modal-mask{position:fixed;inset:0;background:rgba(23,26,46,.4);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);
+  display:none;align-items:center;justify-content:center;z-index:1000;padding:20px;}
 .modal-mask.show{display:flex;animation:fadeIn .2s ease}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
-.modal{
-  background:#fff;border:1px solid var(--border);
-  border-radius:var(--radius-lg);padding:28px;max-width:440px;width:100%;
-  box-shadow:0 24px 64px rgba(23,26,46,.2);
-  animation:modalIn .25s cubic-bezier(.4,0,.2,1);
-}
-@keyframes modalIn{
-  from{opacity:0;transform:scale(.96) translateY(8px)}
-  to{opacity:1;transform:none}
-}
-.modal h3{
-  font-size:17px;margin-bottom:12px;color:var(--warn);
-  display:flex;align-items:center;gap:10px;
-}
+.modal{background:#fff;border:1px solid var(--border);border-radius:var(--radius-lg);padding:28px;max-width:440px;width:100%;
+  box-shadow:0 24px 64px rgba(23,26,46,.2);animation:modalIn .25s cubic-bezier(.4,0,.2,1);}
+@keyframes modalIn{from{opacity:0;transform:scale(.96) translateY(8px)}to{opacity:1;transform:none}}
+.modal h3{font-size:17px;margin-bottom:12px;color:var(--warn);display:flex;align-items:center;gap:10px;}
 .modal p{color:var(--text-dim);font-size:14px;line-height:1.7;margin-bottom:22px}
 .modal p b{color:var(--danger)}
 .modal .actions{display:flex;gap:10px;justify-content:flex-end}
-
-.spin{
-  display:inline-block;width:14px;height:14px;
-  border:2px solid rgba(255,255,255,.3);border-top-color:#fff;
-  border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;
-}
+.spin{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;
+  border-radius:50%;animation:spin .7s linear infinite;vertical-align:-2px;}
 @keyframes spin{to{transform:rotate(360deg)}}
-
 @media (max-width:640px){
   body{padding:24px 16px 60px}
   .container{max-width:100%}
@@ -1354,17 +1396,19 @@ body::after{
       <div class="k">登录时间</div><div class="v" id="sessTime">-</div>
     </div>
 
-    <div class="login-area" id="loginArea">
-      <div class="qr-wrap" id="qrWrapper"><div class="spinner"></div></div>
-      <div class="login-status" id="loginStatusText">正在生成二维码…</div>
-      <div class="link-box">
-        <span>🔗</span>
-        <span class="text" id="linkBox"></span>
+      <div class="login-area" id="loginArea">
+        <div class="qr-wrap" id="qrWrapper"><div class="spinner"></div></div>
+        <div class="login-status" id="loginStatusText">正在生成二维码…</div>
+        <div class="link-box">
+          <span>🔗</span>
+          <span class="text" id="linkBox"></span>
+        </div>
+        <div class="btn-group" style="justify-content:center">
+          <button class="btn btn-ghost btn-sm" onclick="copyLink()">📋 复制链接</button>
+          <button class="btn btn-danger btn-sm" onclick="abortLogin()">🛑 终止登录</button>
+        </div>
       </div>
-      <div class="btn-group" style="justify-content:center">
-        <button class="btn btn-ghost btn-sm" onclick="copyLink()">📋 复制链接</button>
-        <button class="btn btn-danger btn-sm" onclick="abortLogin()">🛑 终止登录</button>
-      </div>
+      <div class="login-error" id="loginError"></div>   <!-- ★ 新增 -->
     </div>
   </div>
 
@@ -1399,6 +1443,14 @@ body::after{
         <div class="desc">插件加载后自动启动微信 Bot</div>
       </div>
       <label class="switch" id="swAutoLogin"><input type="checkbox" id="autoLogin"><span class="track"></span></label>
+    </div>
+
+    <div class="toggle-row">
+      <div class="toggle-info">
+        <div class="title">IP Fallback</div>
+        <div class="desc">DNS 解析失败时启用内置 IP 列表（默认关闭）</div>
+      </div>
+      <label class="switch" id="swUseIpFallback"><input type="checkbox" id="useIpFallback"><span class="track"></span></label>
     </div>
   </div>
 
@@ -1497,6 +1549,8 @@ function render(d){
     $('useBackground').checked = c.use_background === true;
   if (!('auto_login' in state.dirtyKeys))
     $('autoLogin').checked = c.auto_login === true;
+  if (!('use_ip_fallback' in state.dirtyKeys))
+    $('useIpFallback').checked = c.use_ip_fallback === true;
 
   var bs = d.bot_status || 'no_token';
   state.status = bs;
@@ -1510,12 +1564,9 @@ function render(d){
     txt.textContent = '登录中…';
     bStart.disabled = true; bStop.disabled = false; bRestart.disabled = true;
     sess.style.display = 'none';
-    // ★ 只要有任何触发源或二维码已就绪，都显示登录区
     var hasQr = !!(d.qr_image || d.qr_code);
-    var show = getUserLogin()
-            || d.login_source === 'qq'
-            || d.login_source === 'web'
-            || hasQr;
+    var show = getUserLogin() || d.login_source === 'qq'
+            || d.login_source === 'web' || hasQr;
     if (show){
       la.classList.add('show');
       if (!d.qr_image && !d.qr_code){
@@ -1560,7 +1611,21 @@ function render(d){
       stopPoll();
     }
   }
+
+  // ★ 新增：显示最近一次登录失败原因
+  var errBox = $('loginError');
+  if (d.last_error && bs !== 'logging_in') {
+    if (d.last_error_friendly) {
+      errBox.textContent = '⚠️ ' + d.last_error;
+    } else {
+      errBox.textContent = '⚠️ 登录失败，请查看日志或发送「微信登录」重试';
+    }
+    errBox.classList.add('show');
+  } else {
+    errBox.classList.remove('show');
+  }
 }
+
 
 function poll(){
   fetch(API.state).then(function(r){return r.json()}).then(function(r){
@@ -1577,6 +1642,7 @@ function startW(){
   var la = $('loginArea'); la.classList.add('show');
   $('qrWrapper').innerHTML = '<div class="spinner"></div>';
   $('loginStatusText').textContent = '正在生成二维码…';
+  $('loginError').classList.remove('show');
 
   fetch(API.start, {method:'POST'}).then(function(r){return r.json()}).then(function(r){
     if (r.ok){
@@ -1624,6 +1690,7 @@ function confirmRestart(){
   var la = $('loginArea'); la.classList.add('show');
   $('qrWrapper').innerHTML = '<div class="spinner"></div>';
   $('loginStatusText').textContent = '正在生成二维码…';
+  $('loginError').classList.remove('show');
 
   fetch(API.restart, {method:'POST'}).then(function(r){return r.json()}).then(function(r){
     if (r.ok){
@@ -1707,6 +1774,7 @@ document.addEventListener('click', function(e){
   bindToggle('useImage', 'use_image', 'swUseImage');
   bindToggle('useBackground', 'use_background', 'swUseBackground');
   bindToggle('autoLogin', 'auto_login', 'swAutoLogin');
+  bindToggle('useIpFallback', 'use_ip_fallback', 'swUseIpFallback');
 
   if (getUserLogin()) $('loginArea').classList.add('show');
   poll();
@@ -1736,24 +1804,32 @@ async def init():
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, _check_and_install_deps)
     load_config()
+
+    try:
+        ip_fallback.set_use_fallback(_config.get('use_ip_fallback', False))
+    except Exception as e:
+        log.warning(f"[微信Bot] 应用 IP fallback 开关失败: {e}")
+
     _load_submodules()
 
-    # ★ 启动插件独立线程
     if not _ensure_plugin_thread():
         log.error("[微信Bot] 插件线程启动失败")
     else:
         log.info("[微信Bot] 插件线程已就绪")
 
     _wechat_initialized = True
-    log.info(f"[微信Bot] 已加载。微信 API: {WECHAT_BASE_URL}")
-    log.info(f"[微信Bot] fallback IP: {ip_fallback.WECHAT_API_FALLBACK_IPS}")
+    try:
+        enabled = ip_fallback.get_use_fallback()
+    except Exception:
+        enabled = False
+    log.info(f"[微信Bot] IP fallback: {'开' if enabled else '关（默认 DNS）'}")
 
     auto_login = _config.get('auto_login', False)
     if auto_login:
         log.info("[微信Bot] 自动启动...")
         try:
             result = await _await_plugin(_api_start_async(), timeout=20)
-            log.info(f"[微信Bot] 自动启动: {result}")
+            log.info(f"[微信Bot] 自动启动: {result['message']}")
         except Exception as e:
             log.error(f"[微信Bot] 自动启动失败: {e}")
     else:
@@ -1769,20 +1845,93 @@ async def cleanup():
     except Exception as e:
         log.warning(f"[微信Bot] 卸载时停止失败: {e}")
 
-    # 关闭插件线程
     if _plugin_loop is not None:
         try:
             _plugin_loop.call_soon_threadsafe(_plugin_loop.stop)
         except Exception:
             pass
+
     unregister_page('wechat-bot-config')
     _wechat_initialized = False
+
+    try:
+        sys.modules.pop('ip_fallback', None)
+        _purge_plugin_submodules()
+    except Exception:
+        pass
+
     log.info("[微信Bot] 已卸载")
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# QQ 控制指令（框架线程 → 提交到插件线程）
+# QQ 控制指令
 # ══════════════════════════════════════════════════════════════════════════
+
+async def _wait_qr_updates_qq(event, buttons, initial_link: str):
+    """★ v1.0.4：QQ 端持续转发二维码刷新 + 登录最终结果
+
+    - 收到 refreshed → 发送新二维码图片和链接
+    - 收到 done → 发送最终结果并返回
+    - 收到 timeout → 若后台已结束则退出，否则继续等
+    """
+    after_link = initial_link
+    while True:
+        try:
+            status = await _await_plugin(
+                _wait_qr_event_async(after_link, timeout=350), timeout=360)
+        except Exception as e:
+            log.error(f"[微信Bot] 等待二维码事件失败: {e}")
+            return
+
+        t = status.get("type")
+        if t == "done":
+            holder = status.get("holder") or {}
+            if holder.get("ok"):
+                token = holder.get("token") or {}
+                await event.reply(
+                    f"## ✅ 登录成功\nBot: `{token.get('accountId','?')}`",
+                    msg_type=2, buttons=buttons)
+            else:
+                msg = holder.get('msg', '登录未成功')
+                if '终止' in msg:
+                    log.info("[微信Bot] 登录已被用户终止，跳过重复回复")
+                    return
+                await event.reply(f"## ❌ {msg}", msg_type=2, buttons=buttons)
+            return
+
+        if t == "refreshed":
+            new_link = status.get("qr_link", "")
+            after_link = new_link
+            try:
+                new_bytes = generate_qr_image(new_link)
+                await _reply_qq_image(event, new_bytes,
+                                      "📱 二维码已刷新", "wechat-qr.png")
+                await event.reply(
+                    f"## 🔄 二维码已刷新\n---\n```\n{new_link}\n```\n"
+                    f"> 发送 `微信终止` 取消",
+                    msg_type=2, buttons=buttons)
+            except Exception as e:
+                log.error(f"[微信Bot] 发送刷新二维码失败: {e}")
+            continue
+
+        if t == "timeout":
+            # 超时点：检查后台是否已结束
+            try:
+                still = await _await_plugin(_is_login_in_progress_async(), timeout=3)
+            except Exception:
+                still = False
+            if not still:
+                await event.reply(
+                    "## ⏱️ 等待超时，后台登录流程已结束",
+                    msg_type=2, buttons=buttons)
+                return
+            # 后台仍在跑（极少见），继续等
+            continue
+
+        # 未知类型：退出保护
+        log.warning(f"[微信Bot] 未知的 qr event 类型: {t}")
+        return
+
 
 @handler(r'^微信状态$', name='微信状态', desc='查看微信Bot运行状态', owner_only=True)
 async def cmd_wechat_status(event, match):
@@ -1801,22 +1950,17 @@ async def cmd_wechat_status(event, match):
         buttons = [[{'text': '终止', 'data': '微信终止', 'enter': True},
                     {'text': '帮助', 'data': '微信帮助', 'enter': True}]]
         await event.reply(s, msg_type=2, buttons=buttons)
-    
-        # ★ 新增：二维码若已就绪，附带发送
+
         try:
             info = await _await_plugin(_get_qr_info(), timeout=5)
             qr_link = info.get('qr_url', '')
             if qr_link:
                 qr_bytes = generate_qr_image(qr_link)
-                qr_url = await _upload_to_hosting(qr_bytes, "wechat-qr.png", event=event)
-                if qr_url:
-                    await event.reply(
-                        f"## 📱 微信扫码登录\n---\n"
-                        f"![二维码 #360px #360px]({qr_url})\n---\n"
-                        f"```\n{qr_link}\n```",
-                        msg_type=2, buttons=buttons)
-                else:
-                    await event.reply_image(qr_bytes, "📱 请扫描上方二维码")
+                await _reply_qq_image(event, qr_bytes,
+                                      "📱 请扫描上方二维码", "wechat-qr.png")
+                await event.reply(
+                    f"## 📱 微信扫码登录\n---\n```\n{qr_link}\n```",
+                    msg_type=2, buttons=buttons)
         except Exception as e:
             log.error(f"[微信Bot] 状态查询附带二维码失败: {e}")
         return
@@ -1840,24 +1984,28 @@ async def cmd_wechat_login(event, match):
         await event.reply("## ⚠️ 已在运行中", msg_type=2, buttons=buttons)
         return
 
-    # 登录中 → 只回复一次；否则回复"正在生成"
     if bs == 'logging_in':
         await event.reply(
             "## ℹ️ 登录已在进行中，二维码稍后发送\n> 发送 `微信终止` 取消",
             msg_type=2, buttons=buttons)
-        # 不启动新流程，直接进入等二维码环节
     else:
-        await event.reply("## 🔐 正在生成二维码...\n> 发送 `微信终止` 取消",
+        # 用"启动"而不是"生成二维码"，因为有 token 时会直接复用
+        await event.reply("## 🔐 正在启动...\n> 发送 `微信终止` 取消",
                           msg_type=2, buttons=buttons)
         result = await _await_plugin(_api_start_async(), timeout=15)
-        # ★ 只有真正失败才返回；已在进行中 / 已启动 都继续
         if not result.get('ok'):
             await event.reply(
                 f"## ❌ {result.get('message', '启动失败')}",
                 msg_type=2, buttons=buttons)
             return
+        # ★ 关键修复：有 token 直接启动成功，不需要二维码
+        if not result.get('need_login'):
+            await event.reply(
+                f"## ✅ 已启动\n{result.get('message', '复用登录凭证')}",
+                msg_type=2, buttons=buttons)
+            return
 
-    # 等二维码就绪（如果已 ready 会立即返回）
+    # 需要登录 → 走二维码流程
     qr_ok = await _await_plugin(_wait_qr_ready(30), timeout=35)
     if not qr_ok:
         await event.reply("## ❌ 生成二维码超时", msg_type=2, buttons=buttons)
@@ -1869,44 +2017,18 @@ async def cmd_wechat_login(event, match):
         await event.reply("## ⚠️ 二维码未就绪", msg_type=2, buttons=buttons)
         return
 
-    # 发二维码（图床优先，失败降级图片）
     try:
         qr_bytes = generate_qr_image(qr_link)
-        qr_url = await _upload_to_hosting(qr_bytes, "wechat-qr.png", event=event)
-        if qr_url:
-            await event.reply(
-                f"## 📱 微信扫码登录\n---\n"
-                f"![二维码 #360px #360px]({qr_url})\n---\n"
-                f"```\n{qr_link}\n```\n"
-                f"> 发送 `微信终止` 取消",
-                msg_type=2, buttons=buttons)
-        else:
-            await event.reply_image(qr_bytes, "📱 请扫描上方二维码")
-            await event.reply(
-                f"## 📱 微信扫码登录\n---\n```\n{qr_link}\n```\n"
-                f"> 发送 `微信终止` 取消",
-                msg_type=2, buttons=buttons)
-    except Exception as e:
-        log.error(f"[微信Bot] 发二维码失败: {e}")
+        await _reply_qq_image(event, qr_bytes,
+                              "📱 请扫描上方二维码", "wechat-qr.png")
         await event.reply(
             f"## 📱 微信扫码登录\n---\n```\n{qr_link}\n```\n"
             f"> 发送 `微信终止` 取消",
             msg_type=2, buttons=buttons)
+    except Exception as e:
+        log.error(f"[微信Bot] 发二维码失败: {e}")
 
-    # 等登录完成
-    holder = await _await_plugin(_wait_login_done(360), timeout=370)
-    if holder.get('ok'):
-        token = holder.get('token') or {}
-        await event.reply(
-            f"## ✅ 登录成功\nBot: `{token.get('accountId','?')}`",
-            msg_type=2, buttons=buttons)
-    else:
-        msg = holder.get('msg', '登录未成功')
-        # ★ 用户主动终止时，cmd_wechat_abort 已经回复过，不重复
-        if '终止' in msg:
-            log.info("[微信Bot] 登录已被用户终止，跳过重复回复")
-            return
-        await event.reply(f"## ❌ {msg}", msg_type=2, buttons=buttons)
+    await _wait_qr_updates_qq(event, buttons, qr_link)
 
 @handler(r'^微信终止$', name='微信终止', desc='终止登录', owner_only=True)
 async def cmd_wechat_abort(event, match):
@@ -1943,7 +2065,20 @@ async def cmd_wechat_restart(event, match):
                 {'text': '帮助', 'data': '微信帮助', 'enter': True}]]
     await event.reply("## 🔄 重启中...（将清除登录信息，需重新扫码）",
                       msg_type=2, buttons=buttons)
-    await _await_plugin(_api_restart_async(), timeout=20)
+    result = await _await_plugin(_api_restart_async(), timeout=20)
+
+    # 防御性检查：_api_restart_async 当前总是返回 need_login=True，
+    # 但保留检查以应对未来变更
+    if not result.get('ok'):
+        await event.reply(
+            f"## ❌ {result.get('message', '重启失败')}",
+            msg_type=2, buttons=buttons)
+        return
+    if not result.get('need_login'):
+        await event.reply(
+            f"## ✅ 已重启\n{result.get('message', '')}",
+            msg_type=2, buttons=buttons)
+        return
 
     qr_ok = await _await_plugin(_wait_qr_ready(30), timeout=35)
     if not qr_ok:
@@ -1958,35 +2093,16 @@ async def cmd_wechat_restart(event, match):
 
     try:
         qr_bytes = generate_qr_image(qr_link)
-        qr_url = await _upload_to_hosting(qr_bytes, "wechat-qr.png", event=event)
-        if qr_url:
-            await event.reply(
-                f"## 📱 微信扫码登录\n---\n"
-                f"![二维码 #360px #360px]({qr_url})\n---\n"
-                f"```\n{qr_link}\n```\n"
-                f"> 发送 `微信终止` 取消",
-                msg_type=2, buttons=buttons)
-        else:
-            await event.reply_image(qr_bytes, "📱 请扫描上方二维码")
-            await event.reply(
-                f"## 📱 微信扫码登录\n---\n```\n{qr_link}\n```\n"
-                f"> 发送 `微信终止` 取消",
-                msg_type=2, buttons=buttons)
+        await _reply_qq_image(event, qr_bytes,
+                              "📱 请扫描上方二维码", "wechat-qr.png")
+        await event.reply(
+            f"## 📱 微信扫码登录\n---\n```\n{qr_link}\n```\n"
+            f"> 发送 `微信终止` 取消",
+            msg_type=2, buttons=buttons)
     except Exception as e:
         log.error(f"[微信Bot] 发二维码失败: {e}")
 
-    holder = await _await_plugin(_wait_login_done(360), timeout=370)
-    if holder.get('ok'):
-        token = holder.get('token') or {}
-        await event.reply(
-            f"## ✅ 重启成功\nBot: `{token.get('accountId','?')}`",
-            msg_type=2, buttons=buttons)
-    else:
-        msg = holder.get('msg', '重启未成功')
-        if '终止' in msg:
-            log.info("[微信Bot] 重启被用户终止，跳过重复回复")
-            return
-        await event.reply(f"## ❌ {msg}", msg_type=2, buttons=buttons)
+    await _wait_qr_updates_qq(event, buttons, qr_link)
 
 @handler(r'^微信帮助$', name='微信帮助', desc='查看帮助', owner_only=True)
 async def cmd_wechat_help(event, match):
@@ -1995,13 +2111,14 @@ async def cmd_wechat_help(event, match):
                 {'text': '状态', 'data': '微信状态', 'enter': True}]]
     await event.reply(
         "## 🤖 微信 Bot 帮助\n---\n**QQ命令**\n"
-        "<qqbot-cmd-input text='微信登录' /><qqbot-cmd-input text='微信终止' />"
-        "<qqbot-cmd-input text='微信登出' /><qqbot-cmd-input text='微信重启' />"
-        "<qqbot-cmd-input text='微信状态' /><qqbot-cmd-input text='微信帮助' />"
+        "<qqbot-cmd-input text='微信登录' />     <qqbot-cmd-input text='微信终止' />\n"
+        "<qqbot-cmd-input text='微信登出' />     <qqbot-cmd-input text='微信重启' />\n"
+        "<qqbot-cmd-input text='微信状态' />     <qqbot-cmd-input text='微信帮助' />\n"
         "<qqbot-cmd-input text='系统状态' />\n\n"
         "**微信端**\n"
-        "`系统状态` / `图片 <url>` / `帮助` / `机器人列表` / "
-        "`启动` / `关闭` / `dau` / `重启`\n\n"
+        "`帮助`           `机器人列表`\n"
+        "`启动`           `关闭` \n `dau`            `重启`\n"
+        "`系统状态`\n"
         "**Web面板**\n侧边栏「微信Bot 配置」",
         msg_type=2, buttons=buttons,
     )
